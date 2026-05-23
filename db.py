@@ -281,3 +281,43 @@ def stream_stats() -> dict:
         print(f"[db] stream_stats failed: {e}")
         return {"observations": 0, "facilities": 0,
                 "first_event": None, "last_event": None}
+
+
+# --------------------------------------------------------------------------
+# 3. Facility history (drives the per-facility generation chart)
+# --------------------------------------------------------------------------
+
+def get_facility_history(facility_code: str | None,
+                         limit: int = 120) -> list[tuple]:
+    """Return the most recent observations for one facility, oldest first.
+
+    Used by the popup to render a live-updating generation chart. Up to
+    `limit` rows (default 120 = ~10 hours at 5-min spacing). Returns
+    [(event_time, power_mw, emissions_t), ...]; never raises.
+
+    Extension point: a future market-price/demand layer could be joined
+    in here as additional columns without changing the call site.
+    """
+    if not facility_code:
+        return []
+    try:
+        with _DB_LOCK:
+            con = _connect()
+            rows = con.execute(
+                """
+                SELECT event_time, power_mw, emissions_t
+                FROM (
+                    SELECT event_time, power_mw, emissions_t
+                    FROM live_observations
+                    WHERE facility_code = ?
+                    ORDER BY event_time DESC
+                    LIMIT ?
+                ) t
+                ORDER BY event_time ASC
+                """,
+                [facility_code, limit],
+            ).fetchall()
+            return rows
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] history query failed for {facility_code}: {e}")
+        return []
