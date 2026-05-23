@@ -348,6 +348,8 @@ python dashboard_prototype.py   # starts subscriber + dashboard
 |------------|------------------------------------------------------------------------|
 | 2026-05-16 | Initial design doc + prototype skeleton.                               |
 | 2026-05-16 | Task 4 added: build_database.py, db.py, DB-aware dashboard. §12 added. |
+| 2026-05-23 | Iteration 2: generation chart, unit subtable, facility list. §13 added.|
+| 2026-05-23 | Iteration 3: top filter bar, collapsible list, click-to-recentre. §14. |
 
 ---
 
@@ -476,3 +478,107 @@ lock is never a bottleneck. A DB failure in `persist_observation()` is
 caught and logged so it can never kill the subscriber loop; if
 `energy.duckdb` is absent the dashboard degrades gracefully to live-map-
 only (verified by regression test).
+
+---
+
+## 13. Iteration 2 — Generation chart, unit table, facility list
+
+Three additions on top of the Task 4 baseline. All are wired into the
+existing extension points; no architectural change.
+
+### 13.1 Live generation chart (`build_generation_chart`)
+
+Each time the popup re-renders, `db.get_facility_history()` pulls the
+last 120 observations (≈10 hours at the 5-min cadence) for the selected
+facility from `live_observations` and draws a compact area chart of
+`power_mw` over `event_time`. Because the DB is the source of truth, the
+chart **survives dashboard restarts** and extends naturally as new MQTT
+messages stream in.
+
+This is the user-facing payoff for persisting the stream in Task 4.
+
+### 13.2 Unit subtable (`build_unit_table`)
+
+The MQTT message already carries `unit_details` (a list of per-unit
+records). The popup now renders this as a small four-column table
+(unit code, fueltech, registered capacity, dispatch type), one row per
+unit. Directly answers the report question *"how did you handle that
+some power facilities consist of several facility units?"* — at the
+data-acquisition layer we keep the per-unit detail intact in the
+message and surface it on demand in the UI, rather than collapsing it
+at ingest time.
+
+### 13.3 Facility list (`refresh_facility_list`)
+
+A left-side `dash_table.DataTable` lists all received facilities with
+five columns: name, region, tech, capacity, current power. Sorted by
+current power descending by default. Selecting a row updates the same
+`selected-facility` Store as clicking a marker, so the popup is driven
+from one source regardless of which control the user touches. The list
+reuses the same `build_dataframe()` filter pipeline as the map, so the
+region/fueltech filters affect both views consistently.
+
+### 13.4 Layout change
+
+The left side gained one column; the page is now:
+
+```
+controls (200) | facility list (280) | map (flex) | popup (320)
+```
+
+Total fixed: 800 px + flex map. Works on a 1366 px laptop; comfortable
+above 1440 px.
+
+---
+
+## 14. Iteration 3 — Top filter bar, collapsible list, click-to-recentre
+
+UX polish, no architectural change.
+
+### 14.1 Layout: filters moved to a top bar
+
+The original 200-px left column of filters was eating screen real
+estate. It is replaced by a horizontal bar between the header and the
+map area, with three controls:
+
+- **Show** (Power / Emissions) — inline radio
+- **Region** — `dcc.Dropdown(multi=True)` with the five NEM regions
+- **Tech** — `dcc.Dropdown(multi=True)` with the fueltech groups
+
+Both dropdowns are `clearable=False` so the user cannot accidentally
+end up with an empty filter and a blank map.
+
+### 14.2 Collapsible facility list
+
+The list panel is now collapsible. A small "« Hide list" button at the
+top toggles between two states stored in `dcc.Store(id="list-open")`:
+
+| State  | Panel width | Content    | Button label |
+|--------|-------------|------------|--------------|
+| Open   | 290 px      | visible    | "« Hide list"|
+| Closed | 32 px       | `display:none` | "»"      |
+
+A CSS `transition: width 0.2s` keeps the collapse animation smooth.
+Closed state still shows the toggle so it can be reopened.
+
+### 14.3 Click-to-recentre + selection highlight
+
+Selecting a facility (via marker or list row) now recentres the map
+on that facility's lat/lon and draws a translucent red halo over its
+marker. The implementation relies on Plotly's `uirevision` mechanism:
+
+- `uirevision = f"sel-{selected_code or 'none'}"`
+- During poll refreshes with the same selection, `uirevision` is
+  unchanged, so Plotly preserves whatever pan/zoom the user has
+  manually set.
+- When the selection changes, `uirevision` changes, and Plotly applies
+  the new `map.center` we set in the figure layout.
+
+The user requested "zoom unchanged", so we do not override zoom on
+selection — only the centre moves. The red halo (a second
+`Scattermap` trace at +24 px size, opacity 0.35) compensates for the
+fact that at the default continent-wide zoom (4.2) a recentre of a few
+hundred kilometres is visually subtle.
+
+Scattermap markers do not support a CSS-style border, so the halo is
+implemented as an overlaid disc rather than a stroked ring.
