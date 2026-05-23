@@ -28,15 +28,15 @@ import dash
 import pandas as pd
 import paho.mqtt.client as mqtt
 import plotly.graph_objects as go
-from dash import Input, Output, State, dcc, html
-
-import paho.mqtt.client as mqtt
-from paho.mqtt.enums import CallbackAPIVersion
+from dash import Input, Output, State, dash_table, dcc, html
 
 # Task 4 — database persistence + Assignment-1 integration.
 # Isolated in db.py so the dashboard core stays unchanged; if energy.duckdb
 # is missing the dashboard still runs (live map only, no DB features).
 import db as task4_db
+
+import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion
 
 _DB_ENABLED = task4_db.db_available()
 if not _DB_ENABLED:
@@ -316,15 +316,30 @@ def build_dataframe(
     return df
 
 
-def build_map_figure(df: pd.DataFrame, metric: str) -> go.Figure:
-    """Build the scatter_map figure. `metric` ∈ {'power', 'emissions'}."""
+def build_map_figure(df: pd.DataFrame, metric: str,
+                     selected_code: str | None = None) -> go.Figure:
+    """Build the scatter_map figure. `metric` ∈ {'power', 'emissions'}.
+
+    If `selected_code` is given and matches a row in `df`, the map is
+    recentred on that facility and a highlight ring is drawn over it.
+    The map's `uirevision` is keyed on `selected_code`, so:
+      - polling refreshes with the SAME selection preserve user
+        pan/zoom (uirevision unchanged → Plotly keeps camera state)
+      - a NEW selection changes uirevision → Plotly applies the
+        new `center` we set in the layout
+    """
     fig = go.Figure()
+
+    # The uirevision token — see docstring. We embed selected_code so
+    # any selection change triggers Plotly to honour our new `center`.
+    uirev = f"sel-{selected_code or 'none'}"
 
     if df.empty:
         fig.update_layout(
             map={"style": "open-street-map", "center": MAP_CENTER, "zoom": MAP_ZOOM},
             margin={"l": 0, "r": 0, "t": 0, "b": 0},
             height=720,
+            uirevision=uirev,
             annotations=[{
                 "text": "Waiting for MQTT messages…",
                 "xref": "paper", "yref": "paper",
@@ -365,15 +380,42 @@ def build_map_figure(df: pd.DataFrame, metric: str) -> go.Figure:
             text=hover,
             hoverinfo="text",
             customdata=df[["facility_code"]].values,
+            name="facilities",
         )
     )
 
+    # Recentre + highlight if a facility is selected.
+    center = MAP_CENTER
+    if selected_code:
+        sel_rows = df[df["facility_code"] == selected_code]
+        if not sel_rows.empty:
+            r = sel_rows.iloc[0]
+            center = {"lat": float(r["lat"]), "lon": float(r["lon"])}
+            # Highlight halo: a translucent red disc drawn ON TOP of
+            # the main marker (so it shows even on a black coal point)
+            # at slightly larger size. Reads as "this one is selected".
+            fig.add_trace(
+                go.Scattermap(
+                    lat=[r["lat"]],
+                    lon=[r["lon"]],
+                    mode="markers",
+                    marker={
+                        "size": float(r["size"]) + 24,
+                        "color": "#ff4757",
+                        "opacity": 0.35,
+                    },
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name="selection-highlight",
+                )
+            )
+
     fig.update_layout(
-        map={"style": "open-street-map", "center": MAP_CENTER, "zoom": MAP_ZOOM},
+        map={"style": "open-street-map", "center": center, "zoom": MAP_ZOOM},
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
         height=720,
         showlegend=False,
-        uirevision="keep",  # preserves user's pan/zoom across refreshes
+        uirevision=uirev,
     )
 
     # Show the active metric in a small overlay so users know what colour
@@ -461,6 +503,10 @@ def build_popup_card(msg: dict | None) -> list:
         row("Utilisation", f"{utilisation:.1f} %"),
         row("Units", f"{unit_count} ({unit_codes})"),
         row("Last update", format_event_time(msg.get("event_time"))),
+        # Live generation chart (Need 3): pulls history from DuckDB.
+        *build_generation_chart(msg.get("facility_code")),
+        # Unit subtable (Need 1): expand `unit_details` if present.
+        *build_unit_table(msg.get("unit_details")),
         html.Div(
             desc or "(no description)",
             style={
@@ -473,6 +519,110 @@ def build_popup_card(msg: dict | None) -> list:
         # Task 4: integration with Assignment-1 reference data.
         *build_integration_section(
             msg.get("facility_name"), msg.get("network_region")
+        ),
+    ]
+
+
+def build_generation_chart(facility_code: str | None) -> list:
+    """Live mini chart of power_mw over event_time, fed by live_observations.
+
+    Need 3: dynamic generation chart. Each refresh re-queries the DB so
+    the chart extends as new MQTT messages arrive. Falls back to a
+    placeholder if the DB is disabled or has < 2 points.
+    """
+    if not _DB_ENABLED or not facility_code:
+        return []
+    history = task4_db.get_facility_history(facility_code, limit=120)
+    if len(history) < 2:
+        return [
+            html.Div(
+                f"Generation history: collecting… ({len(history)} point so far)",
+                style={"marginTop": "12px", "fontSize": "11px",
+                       "color": "#999", "fontStyle": "italic"},
+            )
+        ]
+
+    xs = [r[0] for r in history]
+    ys_power = [r[1] for r in history]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=xs, y=ys_power, mode="lines",
+            line={"color": "#2c3e50", "width": 1.6},
+            fill="tozeroy", fillcolor="rgba(44,62,80,0.15)",
+            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:.1f} MW<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=140,
+        margin={"l": 4, "r": 4, "t": 4, "b": 4},
+        xaxis={"showgrid": False, "tickfont": {"size": 9}},
+        yaxis={"title": "MW", "tickfont": {"size": 9},
+               "title_font": {"size": 10}, "gridcolor": "#eee"},
+        plot_bgcolor="#fff",
+        showlegend=False,
+    )
+
+    return [
+        html.Div(
+            f"Generation history ({len(history)} obs)",
+            style={"marginTop": "14px", "fontSize": "12px",
+                   "fontWeight": 600, "color": "#444"},
+        ),
+        dcc.Graph(
+            figure=fig,
+            config={"displayModeBar": False},
+            style={"height": "140px", "marginTop": "4px"},
+        ),
+    ]
+
+
+def build_unit_table(unit_details: list | None) -> list:
+    """Render the facility's units as a compact table (Need 1).
+
+    Mirrors the OpenElectricity style: one row per unit with code,
+    fueltech, registered MW, and dispatch type. Handles the
+    'a facility has several units' point that the report asks about.
+    """
+    if not unit_details:
+        return []
+
+    header = html.Tr([
+        html.Th("Unit",     style={"textAlign": "left",  "fontSize": "10px", "color": "#777", "padding": "2px 4px"}),
+        html.Th("Fueltech", style={"textAlign": "left",  "fontSize": "10px", "color": "#777", "padding": "2px 4px"}),
+        html.Th("Cap.",     style={"textAlign": "right", "fontSize": "10px", "color": "#777", "padding": "2px 4px"}),
+        html.Th("Type",     style={"textAlign": "left",  "fontSize": "10px", "color": "#777", "padding": "2px 4px"}),
+    ])
+    rows = [header]
+    for u in unit_details:
+        cap = u.get("capacity_registered")
+        rows.append(html.Tr([
+            html.Td(u.get("unit_code_display") or u.get("unit_code") or "—",
+                    style={"fontSize": "11px", "padding": "2px 4px",
+                           "fontFamily": "monospace"}),
+            html.Td(u.get("fueltech_id") or "—",
+                    style={"fontSize": "11px", "padding": "2px 4px",
+                           "color": fueltech_to_colour(u.get("fueltech_id") or "")}),
+            html.Td(f"{cap:,.1f}" if cap is not None else "—",
+                    style={"fontSize": "11px", "padding": "2px 4px",
+                           "textAlign": "right"}),
+            html.Td(u.get("dispatch_type") or "—",
+                    style={"fontSize": "10px", "padding": "2px 4px",
+                           "color": "#666"}),
+        ]))
+
+    return [
+        html.Div(
+            f"Units ({len(unit_details)})",
+            style={"marginTop": "14px", "fontSize": "12px",
+                   "fontWeight": 600, "color": "#444"},
+        ),
+        html.Table(
+            rows,
+            style={"width": "100%", "borderCollapse": "collapse",
+                   "marginTop": "4px",
+                   "border": "1px solid #eee"},
         ),
     ]
 
@@ -591,13 +741,16 @@ app.layout = html.Div(
             },
         ),
 
-        # ---- Main area: controls | map | popup --------------------------
+        # ---- Filter bar (horizontal, replaces the old left column) ----
         html.Div(
             [
-                # Controls
+                # Metric toggle: horizontal radio
                 html.Div(
                     [
-                        html.Div("Display metric", style={"fontWeight": 600, "marginBottom": "6px"}),
+                        html.Span("Show:", style={"fontWeight": 600,
+                                                  "fontSize": "12px",
+                                                  "color": "#555",
+                                                  "marginRight": "8px"}),
                         dcc.RadioItems(
                             id="metric-toggle",
                             options=[
@@ -605,33 +758,144 @@ app.layout = html.Div(
                                 {"label": " Emissions", "value": "emissions"},
                             ],
                             value="power",
-                            labelStyle={"display": "block", "marginBottom": "4px"},
-                        ),
-
-                        html.Hr(),
-                        html.Div("Region", style={"fontWeight": 600, "marginBottom": "6px"}),
-                        dcc.Checklist(
-                            id="region-filter",
-                            options=[{"label": f" {r}", "value": r} for r in NEM_REGIONS],
-                            value=list(NEM_REGIONS),
-                            labelStyle={"display": "block", "marginBottom": "4px"},
-                        ),
-
-                        html.Hr(),
-                        html.Div("Fuel technology", style={"fontWeight": 600, "marginBottom": "6px"}),
-                        dcc.Checklist(
-                            id="fueltech-filter",
-                            options=[{"label": f" {g}", "value": g} for g in FUELTECH_GROUPS],
-                            value=list(FUELTECH_GROUPS),
-                            labelStyle={"display": "block", "marginBottom": "4px"},
+                            inline=True,
+                            labelStyle={"marginRight": "12px",
+                                        "fontSize": "12px"},
                         ),
                     ],
-                    style={
-                        "width": "200px",
-                        "padding": "16px",
-                        "borderRight": "1px solid #ddd",
-                        "fontSize": "13px",
-                    },
+                    style={"display": "flex", "alignItems": "center"},
+                ),
+                # Region multi-select dropdown
+                html.Div(
+                    [
+                        html.Span("Region:", style={"fontWeight": 600,
+                                                    "fontSize": "12px",
+                                                    "color": "#555",
+                                                    "marginRight": "6px"}),
+                        dcc.Dropdown(
+                            id="region-filter",
+                            options=[{"label": r, "value": r}
+                                     for r in NEM_REGIONS],
+                            value=list(NEM_REGIONS),
+                            multi=True,
+                            clearable=False,
+                            style={"width": "220px", "fontSize": "12px"},
+                        ),
+                    ],
+                    style={"display": "flex", "alignItems": "center"},
+                ),
+                # Fueltech multi-select dropdown
+                html.Div(
+                    [
+                        html.Span("Tech:", style={"fontWeight": 600,
+                                                  "fontSize": "12px",
+                                                  "color": "#555",
+                                                  "marginRight": "6px"}),
+                        dcc.Dropdown(
+                            id="fueltech-filter",
+                            options=[{"label": g, "value": g}
+                                     for g in FUELTECH_GROUPS],
+                            value=list(FUELTECH_GROUPS),
+                            multi=True,
+                            clearable=False,
+                            style={"width": "320px", "fontSize": "12px"},
+                        ),
+                    ],
+                    style={"display": "flex", "alignItems": "center"},
+                ),
+            ],
+            style={
+                "display": "flex",
+                "gap": "20px",
+                "padding": "10px 20px",
+                "borderBottom": "1px solid #ddd",
+                "backgroundColor": "#fafafa",
+                "flexWrap": "wrap",
+            },
+        ),
+
+        # ---- Main area: [collapsible list] | map | popup ----------------
+        html.Div(
+            [
+                # Facility list (collapsible, Need 2)
+                html.Div(
+                    id="facility-list-panel",
+                    children=[
+                        html.Button(
+                            "« Hide list",
+                            id="toggle-facility-list",
+                            n_clicks=0,
+                            style={
+                                "width": "100%",
+                                "padding": "8px",
+                                "fontSize": "11px",
+                                "fontWeight": 600,
+                                "border": "none",
+                                "borderBottom": "1px solid #ddd",
+                                "backgroundColor": "#f4f4f4",
+                                "cursor": "pointer",
+                                "textAlign": "center",
+                                "color": "#444",
+                            },
+                        ),
+                        html.Div(
+                            id="facility-list-content",
+                            children=[
+                                html.Div(
+                                    [
+                                        html.Span("Facilities",
+                                                  style={"fontWeight": 600,
+                                                         "fontSize": "13px"}),
+                                        html.Span(id="facility-list-count",
+                                                  style={"marginLeft": "8px",
+                                                         "color": "#888",
+                                                         "fontSize": "11px"}),
+                                    ],
+                                    style={"padding": "10px 12px 6px 12px"},
+                                ),
+                                dash_table.DataTable(
+                                    id="facility-list",
+                                    columns=[
+                                        {"name": "Name",   "id": "facility_name"},
+                                        {"name": "Region", "id": "region"},
+                                        {"name": "Tech",   "id": "fueltech_group"},
+                                        {"name": "Cap MW", "id": "capacity_mw",
+                                         "type": "numeric",
+                                         "format": {"specifier": ",.0f"}},
+                                        {"name": "Now MW", "id": "power_mw",
+                                         "type": "numeric",
+                                         "format": {"specifier": ",.1f"}},
+                                    ],
+                                    data=[],
+                                    sort_action="native",
+                                    sort_by=[{"column_id": "power_mw",
+                                              "direction": "desc"}],
+                                    row_selectable="single",
+                                    selected_rows=[],
+                                    page_action="none",
+                                    style_table={"overflowY": "auto",
+                                                 "height": "640px"},
+                                    style_cell={"fontSize": "11px",
+                                                "padding": "4px 6px",
+                                                "fontFamily": "system-ui"},
+                                    style_header={"fontSize": "10px",
+                                                  "fontWeight": 700,
+                                                  "backgroundColor": "#f4f4f4",
+                                                  "textTransform": "uppercase",
+                                                  "color": "#555"},
+                                    style_data_conditional=[
+                                        {"if": {"state": "selected"},
+                                         "backgroundColor": "#e8f0fe",
+                                         "border": "1px solid #2c3e50"},
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                    style={"width": "290px",
+                           "borderRight": "1px solid #ddd",
+                           "backgroundColor": "#fdfdfd",
+                           "transition": "width 0.2s"},
                 ),
 
                 # Map
@@ -662,6 +926,8 @@ app.layout = html.Div(
 
         # Persists the currently-clicked facility code across renders.
         dcc.Store(id="selected-facility", data=None),
+        # Persists the open/closed state of the facility list panel.
+        dcc.Store(id="list-open", data=True),
     ],
     style={"fontFamily": "system-ui, -apple-system, sans-serif"},
 )
@@ -678,15 +944,16 @@ app.layout = html.Div(
     Input("metric-toggle", "value"),
     Input("region-filter", "value"),
     Input("fueltech-filter", "value"),
+    Input("selected-facility", "data"),
 )
-def refresh_map(n, metric, regions, fueltech_groups):  # noqa: ARG001
+def refresh_map(n, metric, regions, fueltech_groups, selected_code):  # noqa: ARG001
     state, last_at = get_state_snapshot()
     df = build_dataframe(
         state,
         regions or [],
         fueltech_groups or [],
     )
-    fig = build_map_figure(df, metric)
+    fig = build_map_figure(df, metric, selected_code=selected_code)
 
     # KPI cells in the header.
     def cell(label: str, value: str) -> html.Div:
@@ -717,17 +984,65 @@ def refresh_map(n, metric, regions, fueltech_groups):  # noqa: ARG001
 
 
 @app.callback(
+    Output("facility-list", "data"),
+    Output("facility-list-count", "children"),
+    Input("poll", "n_intervals"),
+    Input("region-filter", "value"),
+    Input("fueltech-filter", "value"),
+)
+def refresh_facility_list(n, regions, fueltech_groups):  # noqa: ARG001
+    """Populate the left-hand facility list (Need 2).
+
+    Reuses the same `build_dataframe` filter pipeline as the map, so the
+    list and the map are always in sync (filter region/fueltech once,
+    both views update).
+    """
+    state, _ = get_state_snapshot()
+    df = build_dataframe(state, regions or [], fueltech_groups or [])
+    if df.empty:
+        return [], "(0)"
+    rows = (
+        df[["facility_code", "facility_name", "region",
+            "fueltech_group", "capacity_mw", "power_mw"]]
+        .sort_values("power_mw", ascending=False)
+        .to_dict("records")
+    )
+    return rows, f"({len(rows)})"
+
+
+@app.callback(
     Output("selected-facility", "data"),
     Input("facility-map", "clickData"),
+    Input("facility-list", "selected_rows"),
+    State("facility-list", "data"),
     State("selected-facility", "data"),
 )
-def handle_click(click_data, current):
-    if not click_data:
+def handle_select(click_data, selected_rows, list_data, current):
+    """Update the selected-facility store from either source.
+
+    A click on the map and a row selection in the list both feed into
+    the same `selected-facility` Store, so downstream (popup) only
+    has to listen to one input. Uses callback_context to determine
+    which input actually fired this round.
+    """
+    trigger = dash.callback_context.triggered
+    if not trigger:
         return current
-    try:
-        return click_data["points"][0]["customdata"][0]
-    except (KeyError, IndexError, TypeError):
-        return current
+    src = trigger[0]["prop_id"].split(".")[0]
+
+    if src == "facility-map" and click_data:
+        try:
+            return click_data["points"][0]["customdata"][0]
+        except (KeyError, IndexError, TypeError):
+            return current
+
+    if src == "facility-list" and selected_rows and list_data:
+        try:
+            return list_data[selected_rows[0]]["facility_code"]
+        except (KeyError, IndexError, TypeError):
+            return current
+
+    return current
 
 
 @app.callback(
@@ -740,6 +1055,49 @@ def refresh_popup(facility_code, n):  # noqa: ARG001
         return build_popup_card(None)
     state, _ = get_state_snapshot()
     return build_popup_card(state.get(facility_code))
+
+
+# ---- Collapsible facility-list panel ----------------------------------
+
+@app.callback(
+    Output("list-open", "data"),
+    Input("toggle-facility-list", "n_clicks"),
+    State("list-open", "data"),
+    prevent_initial_call=True,
+)
+def toggle_list_open(_n, is_open):
+    """Flip the open/closed state on every button click."""
+    return not bool(is_open)
+
+
+@app.callback(
+    Output("facility-list-panel", "style"),
+    Output("facility-list-content", "style"),
+    Output("toggle-facility-list", "children"),
+    Input("list-open", "data"),
+)
+def apply_list_open(is_open):
+    """Reflect the list-open state in the panel width and button label.
+
+    When closed the panel shrinks to 32px, leaving just the toggle
+    button visible on the left so it can be reopened. When open it
+    expands back to 290px and shows the table.
+    """
+    base_panel_style = {
+        "borderRight": "1px solid #ddd",
+        "backgroundColor": "#fdfdfd",
+        "transition": "width 0.2s",
+        "overflow": "hidden",
+    }
+    if is_open:
+        panel = {**base_panel_style, "width": "290px"}
+        content = {"display": "block"}
+        label = "« Hide list"
+    else:
+        panel = {**base_panel_style, "width": "32px"}
+        content = {"display": "none"}
+        label = "»"
+    return panel, content, label
 
 
 # ---------------------------------------------------------------------------
