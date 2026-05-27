@@ -56,7 +56,12 @@ _CON: duckdb.DuckDBPyConnection | None = None
 # --------------------------------------------------------------------------
 
 def _connect() -> duckdb.DuckDBPyConnection:
-    """Open (once) the shared connection. Raises if the DB is missing."""
+    """Open (once) the shared connection. Raises if the DB is missing.
+
+    Loads the spatial extension on every fresh connection so writes
+    using ST_Point() and reads of GEOMETRY columns work. INSTALL was
+    already done by build_database.py; LOAD is cheap and idempotent.
+    """
     global _CON
     if _CON is None:
         if not os.path.exists(DB_PATH):
@@ -64,6 +69,12 @@ def _connect() -> duckdb.DuckDBPyConnection:
                 f"{DB_PATH} not found. Run `python build_database.py` first."
             )
         _CON = duckdb.connect(DB_PATH)
+        try:
+            _CON.execute("LOAD spatial;")
+        except Exception as e:  # noqa: BLE001
+            # Non-fatal: persistence still works, only spatial reads
+            # would fail. Log and continue.
+            print(f"[db] WARNING: spatial extension not loaded: {e}")
     return _CON
 
 
@@ -107,17 +118,30 @@ def region_to_state(network_region: str | None) -> str | None:
 # --------------------------------------------------------------------------
 
 def persist_observation(msg: dict[str, Any]) -> None:
-    """Insert one MQTT message into live_observations (idempotent).
+    """Persist one MQTT message into the star schema.
 
-    Safe to call from the MQTT thread: all exceptions are swallowed and
-    logged so a DB hiccup never kills the subscriber loop.
+    Two-step write under a single lock:
+      1. UPSERT into facility_dim so the FK on live_observations can
+         be satisfied (and so first_seen / last_seen track the
+         lifecycle of each facility).
+      2. INSERT OR REPLACE into live_observations.
+
+    Safe to call from the MQTT thread: all exceptions are swallowed
+    and logged so a DB hiccup never kills the subscriber loop.
     """
     try:
         facility_code = msg.get("facility_code")
         if not facility_code:
             return
+        event_time = msg.get("event_time")
+        if not event_time:
+            # Defensive: skip messages without a timestamp — the fact
+            # PK is (facility_code, event_time), NULL would fail.
+            return
 
-        # primary fueltech: first non-charging/discharging token
+        # Derive the primary fueltech (see PROJECT_DOC §5.1):
+        # the first non-charging/discharging token in the pipe-
+        # separated summary.
         ft_summary = msg.get("fueltech_summary") or ""
         primary_ft = "unknown"
         for p in [x for x in ft_summary.split("|") if x]:
@@ -129,33 +153,84 @@ def persist_observation(msg: dict[str, Any]) -> None:
             if parts:
                 primary_ft = parts[0]
 
-        row = (
+        state = region_to_state(msg.get("network_region"))
+        lat = msg.get("latitude")
+        lon = msg.get("longitude")
+        now = datetime.now()
+
+        dim_row = (
             facility_code,
             msg.get("facility_name"),
             msg.get("network_id"),
             msg.get("network_region"),
-            region_to_state(msg.get("network_region")),
-            msg.get("event_time"),
-            msg.get("power_mw"),
-            msg.get("emissions_t"),
+            state,
             primary_ft,
             ft_summary or None,
             msg.get("capacity_registered_total"),
             msg.get("unit_count"),
-            msg.get("latitude"),
-            msg.get("longitude"),
-            datetime.now(),
+            lat,
+            lon,
+            now,  # first_seen — only used on insert (see ON CONFLICT below)
+            now,  # last_seen — overwritten every observation
+        )
+        fact_row = (
+            facility_code,
+            event_time,
+            msg.get("power_mw"),
+            msg.get("emissions_t"),
+            now,
         )
 
         with _DB_LOCK:
             con = _connect()
-            # INSERT OR REPLACE => idempotent on (facility_code, event_time)
+            # --- dim: UPSERT --------------------------------------------
+            # geom is built server-side from (lon, lat) using ST_Point,
+            # which is the standard (X=lon, Y=lat) convention. ON
+            # CONFLICT updates the slow-changing fields and last_seen
+            # but preserves first_seen.
             con.execute(
                 """
-                INSERT OR REPLACE INTO live_observations VALUES
-                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO facility_dim (
+                    facility_code, facility_name, network_id, network_region,
+                    state, primary_fueltech, fueltech_summary,
+                    capacity_registered_total, unit_count,
+                    latitude, longitude, geom, first_seen, last_seen
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,
+                          CASE WHEN ? IS NOT NULL AND ? IS NOT NULL
+                               THEN ST_Point(?, ?) ELSE NULL END,
+                          ?, ?)
+                ON CONFLICT (facility_code) DO UPDATE SET
+                    facility_name             = EXCLUDED.facility_name,
+                    network_id                = EXCLUDED.network_id,
+                    network_region            = EXCLUDED.network_region,
+                    state                     = EXCLUDED.state,
+                    primary_fueltech          = EXCLUDED.primary_fueltech,
+                    fueltech_summary          = EXCLUDED.fueltech_summary,
+                    capacity_registered_total = EXCLUDED.capacity_registered_total,
+                    unit_count                = EXCLUDED.unit_count,
+                    latitude                  = EXCLUDED.latitude,
+                    longitude                 = EXCLUDED.longitude,
+                    geom                      = EXCLUDED.geom,
+                    last_seen                 = EXCLUDED.last_seen
                 """,
-                row,
+                (
+                    *dim_row[:11],   # facility_code .. longitude
+                    lon, lat,        # geom guard: both must be non-null
+                    lon, lat,        # ST_Point(lon, lat)
+                    dim_row[11],     # first_seen
+                    dim_row[12],     # last_seen
+                ),
+            )
+            # --- fact: INSERT OR REPLACE -------------------------------
+            # Idempotent on (facility_code, event_time). FK to dim is
+            # satisfied because we just upserted the parent row.
+            con.execute(
+                """
+                INSERT OR REPLACE INTO live_observations
+                    (facility_code, event_time, power_mw, emissions_t, ingested_at)
+                VALUES (?,?,?,?,?)
+                """,
+                fact_row,
             )
     except Exception as e:  # noqa: BLE001
         print(f"[db] persist failed for {msg.get('facility_code')}: {e}")
