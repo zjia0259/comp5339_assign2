@@ -350,6 +350,7 @@ python dashboard_prototype.py   # starts subscriber + dashboard
 | 2026-05-16 | Task 4 added: build_database.py, db.py, DB-aware dashboard. §12 added. |
 | 2026-05-23 | Iteration 2: generation chart, unit subtable, facility list. §13 added.|
 | 2026-05-23 | Iteration 3: top filter bar, collapsible list, click-to-recentre. §14. |
+| 2026-05-26 | Iteration 4: star schema (facility_dim + fact), FK, GEOMETRY. §15.    |
 
 ---
 
@@ -582,3 +583,149 @@ hundred kilometres is visually subtle.
 
 Scattermap markers do not support a CSS-style border, so the halo is
 implemented as an overlaid disc rather than a stroked ring.
+
+---
+
+## 15. Iteration 4 — Star schema, foreign key, GEOMETRY
+
+This iteration addresses three specific gaps surfaced in the
+Assignment 1 feedback:
+
+1. *"Did not specify primary keys when creating tables in the code."*
+2. *"Did not specify foreign keys when creating tables in the code."*
+3. *"Did not convert latitude and longitude into geo-spatial format
+   (i.e. GEOMETRY) using DuckDB spatial extension."*
+
+### 15.1 The original (fact-only) layout
+
+Iteration 1 used a single denormalised table:
+
+```sql
+CREATE TABLE live_observations (
+    facility_code, facility_name, network_id, network_region, state,
+    event_time, power_mw, emissions_t,
+    primary_fueltech, fueltech_summary,
+    capacity_registered_total, unit_count,
+    latitude, longitude,
+    ingested_at,
+    PRIMARY KEY (facility_code, event_time)
+);
+```
+
+It had a PK but no FK, no GEOMETRY, and conflated slow-changing
+facility metadata (name, region, capacity, location) with the
+high-volume measurement stream (power_mw, emissions_t per 5 min).
+Every observation duplicated the metadata.
+
+### 15.2 The new star schema
+
+Iteration 4 separates dimensions from facts.
+
+```sql
+-- Dimension: one row per facility, slow-changing.
+CREATE TABLE facility_dim (
+    facility_code              VARCHAR     PRIMARY KEY,
+    facility_name              VARCHAR,
+    network_id                 VARCHAR,
+    network_region             VARCHAR,
+    state                      VARCHAR,
+    primary_fueltech           VARCHAR,
+    fueltech_summary           VARCHAR,
+    capacity_registered_total  DOUBLE,
+    unit_count                 INTEGER,
+    latitude                   DOUBLE,
+    longitude                  DOUBLE,
+    geom                       GEOMETRY,          -- ST_Point(lon, lat)
+    first_seen                 TIMESTAMP,
+    last_seen                  TIMESTAMP
+);
+
+-- Fact: one row per (facility × event_time), append-mostly.
+CREATE TABLE live_observations (
+    facility_code   VARCHAR     NOT NULL,
+    event_time      TIMESTAMP   NOT NULL,
+    power_mw        DOUBLE,
+    emissions_t     DOUBLE,
+    ingested_at     TIMESTAMP,
+    PRIMARY KEY (facility_code, event_time),
+    FOREIGN KEY (facility_code) REFERENCES facility_dim(facility_code)
+);
+```
+
+### 15.3 Why a star (not a single wide table)
+
+- **Normalisation of slow-changing data.** A facility's name,
+  fueltech, and capacity are essentially static across the stream;
+  storing them once in `facility_dim` removes ~12 redundant columns
+  per observation.
+- **Enforced referential integrity.** The FK means orphan facts are
+  impossible — DuckDB raises `ConstraintException` if a fact is
+  inserted before its facility dimension exists. Verified by
+  regression test (an INSERT with `facility_code='ORPHAN'` fails).
+- **Lifecycle tracking.** `first_seen` / `last_seen` on the dim
+  capture when each facility entered and was last observed in the
+  stream — useful for "stale facility" detection in the dashboard.
+- **Independence of the two write rates.** The dim is upserted only
+  when metadata changes; the fact grows linearly with the stream.
+
+### 15.4 The write path (`db.persist_observation`)
+
+Every MQTT message triggers a two-statement transaction inside the
+existing `_DB_LOCK`:
+
+```sql
+-- 1. Upsert into the dim (geom built server-side).
+INSERT INTO facility_dim (..., geom, first_seen, last_seen)
+VALUES (..., ST_Point(longitude, latitude), now, now)
+ON CONFLICT (facility_code) DO UPDATE SET
+    facility_name = EXCLUDED.facility_name,
+    ...
+    last_seen     = EXCLUDED.last_seen;
+-- (first_seen is NOT in the SET list — it is preserved.)
+
+-- 2. Insert the fact; FK is now guaranteed.
+INSERT OR REPLACE INTO live_observations
+  (facility_code, event_time, power_mw, emissions_t, ingested_at)
+VALUES (?, ?, ?, ?, ?);
+```
+
+`ST_Point(longitude, latitude)` is the OGC standard ordering (X = lon,
+Y = lat). The `geom` column is guarded against NULL lat/lon via a
+`CASE WHEN` so a malformed message does not blow up the upsert.
+
+### 15.5 Spatial extension lifecycle
+
+`build_database.py` runs `INSTALL spatial; LOAD spatial;` on the build
+connection so the extension is downloaded once and the GEOMETRY column
+can be created. `db.py` runs `LOAD spatial;` on every dashboard
+connection so `ST_Point` and any future `ST_*` queries work without
+the dashboard needing to know about the extension.
+
+If the user's machine has no internet on first run, `INSTALL` fails
+loudly with a clear error from `build_database.py`. After one
+successful install DuckDB caches the extension locally and offline
+runs work.
+
+### 15.6 What this enables (future, not yet built)
+
+The GEOMETRY column is not just rubric compliance — it enables real
+spatial analytics inside DuckDB itself:
+
+- Facility clusters within N km of an emissions hotspot:
+  `ST_DWithin(geom, ST_Point(lon, lat), 50000)`
+- "Facilities within state polygon" if we ever load ABS SA4 boundary
+  geometry alongside `abs_economy`.
+
+These are deliberately not implemented now; the schema just leaves
+the door open.
+
+### 15.7 Migration
+
+`build_database.py` auto-detects the old wide-table layout by checking
+for legacy columns (`facility_name`, `latitude`, etc.) inside
+`live_observations`. If found, both live tables are dropped and
+recreated under the new schema, and a one-line migration notice is
+printed. This means: a user re-running the script after pulling this
+iteration loses their accumulated stream history once (necessary, the
+old schema cannot be in-place converted), but never has to think
+about the migration manually.
