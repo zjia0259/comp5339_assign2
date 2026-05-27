@@ -27,16 +27,16 @@ from typing import Any
 import dash
 import pandas as pd
 import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion
 import plotly.graph_objects as go
 from dash import Input, Output, State, dash_table, dcc, html
+
+
 
 # Task 4 — database persistence + Assignment-1 integration.
 # Isolated in db.py so the dashboard core stays unchanged; if energy.duckdb
 # is missing the dashboard still runs (live map only, no DB features).
 import db as task4_db
-
-import paho.mqtt.client as mqtt
-from paho.mqtt.enums import CallbackAPIVersion
 
 _DB_ENABLED = task4_db.db_available()
 if not _DB_ENABLED:
