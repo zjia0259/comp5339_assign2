@@ -2,12 +2,19 @@
 COMP5339 Assignment 2 — Task 4: database persistence + integration.
 
 This module is the single seam between the live MQTT stream and the
-DuckDB database built by build_database.py. It does two jobs:
+DuckDB database built by build_database.py. It does three jobs:
 
   1. persist_observation(msg)
-     Write one MQTT message into live_observations (idempotent).
+     Write one per-facility MQTT message into facility_dim +
+     live_observations (idempotent).
 
-  2. get_integration(facility_name, state)
+  2. persist_market(msg)
+     Write one per-region market MQTT message (price + demand) into
+     market_observations (idempotent). The market_observations table
+     is auto-created on first connect, so build_database.py does NOT
+     need to know about it.
+
+  3. get_integration(facility_name, state)
      Join the live facility against the Assignment-1 reference tables to
      answer the report question "how do you integrate the MQTT messages
      with your existing data from Assignment 1?". Returns historical
@@ -56,7 +63,17 @@ _CON: duckdb.DuckDBPyConnection | None = None
 # --------------------------------------------------------------------------
 
 def _connect() -> duckdb.DuckDBPyConnection:
-    """Open (once) the shared connection. Raises if the DB is missing."""
+    """Open (once) the shared connection. Raises if the DB is missing.
+
+    Loads the spatial extension on every fresh connection so writes
+    using ST_Point() and reads of GEOMETRY columns work. INSTALL was
+    already done by build_database.py; LOAD is cheap and idempotent.
+
+    Also auto-creates the market_observations table on first connect
+    so that build_database.py does not need to be modified when adding
+    the optional Task-1 (price/demand) feed. The CREATE is IF NOT
+    EXISTS so it is a no-op once the table is in place.
+    """
     global _CON
     if _CON is None:
         if not os.path.exists(DB_PATH):
@@ -64,6 +81,31 @@ def _connect() -> duckdb.DuckDBPyConnection:
                 f"{DB_PATH} not found. Run `python build_database.py` first."
             )
         _CON = duckdb.connect(DB_PATH)
+        try:
+            _CON.execute("LOAD spatial;")
+        except Exception as e:  # noqa: BLE001
+            # Non-fatal: persistence still works, only spatial reads
+            # would fail. Log and continue.
+            print(f"[db] WARNING: spatial extension not loaded: {e}")
+        # Auto-create the market table. Keyed on (region, event_time)
+        # so the publisher's 60-second replay is idempotent under
+        # INSERT OR REPLACE. No FK: NEM regions are a closed set, not
+        # a user-defined dimension.
+        try:
+            _CON.execute(
+                """
+                CREATE TABLE IF NOT EXISTS market_observations (
+                    network_region    VARCHAR    NOT NULL,
+                    event_time        TIMESTAMP  NOT NULL,
+                    price_aud_mwh     DOUBLE,
+                    demand_mw_region  DOUBLE,
+                    ingested_at       TIMESTAMP,
+                    PRIMARY KEY (network_region, event_time)
+                );
+                """
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[db] WARNING: could not ensure market_observations: {e}")
     return _CON
 
 
@@ -107,17 +149,30 @@ def region_to_state(network_region: str | None) -> str | None:
 # --------------------------------------------------------------------------
 
 def persist_observation(msg: dict[str, Any]) -> None:
-    """Insert one MQTT message into live_observations (idempotent).
+    """Persist one MQTT message into the star schema.
 
-    Safe to call from the MQTT thread: all exceptions are swallowed and
-    logged so a DB hiccup never kills the subscriber loop.
+    Two-step write under a single lock:
+      1. UPSERT into facility_dim so the FK on live_observations can
+         be satisfied (and so first_seen / last_seen track the
+         lifecycle of each facility).
+      2. INSERT OR REPLACE into live_observations.
+
+    Safe to call from the MQTT thread: all exceptions are swallowed
+    and logged so a DB hiccup never kills the subscriber loop.
     """
     try:
         facility_code = msg.get("facility_code")
         if not facility_code:
             return
+        event_time = msg.get("event_time")
+        if not event_time:
+            # Defensive: skip messages without a timestamp — the fact
+            # PK is (facility_code, event_time), NULL would fail.
+            return
 
-        # primary fueltech: first non-charging/discharging token
+        # Derive the primary fueltech (see PROJECT_DOC §5.1):
+        # the first non-charging/discharging token in the pipe-
+        # separated summary.
         ft_summary = msg.get("fueltech_summary") or ""
         primary_ft = "unknown"
         for p in [x for x in ft_summary.split("|") if x]:
@@ -129,34 +184,72 @@ def persist_observation(msg: dict[str, Any]) -> None:
             if parts:
                 primary_ft = parts[0]
 
-        row = (
+        state = region_to_state(msg.get("network_region"))
+        lat = msg.get("latitude")
+        lon = msg.get("longitude")
+        now = datetime.now()
+
+        dim_row = (
             facility_code,
             msg.get("facility_name"),
             msg.get("network_id"),
             msg.get("network_region"),
-            region_to_state(msg.get("network_region")),
-            msg.get("event_time"),
-            msg.get("power_mw"),
-            msg.get("emissions_t"),
+            state,
             primary_ft,
             ft_summary or None,
             msg.get("capacity_registered_total"),
             msg.get("unit_count"),
-            msg.get("latitude"),
-            msg.get("longitude"),
-            datetime.now(),
+            lat,
+            lon,
+            now,  # first_seen — only used on insert (see ON CONFLICT below)
+            now,  # last_seen — overwritten every observation
         )
-
+        fact_row = (
+            facility_code,
+            event_time,
+            msg.get("power_mw"),
+            msg.get("emissions_t"),
+            now,
+        )
         with _DB_LOCK:
             con = _connect()
-            # INSERT OR REPLACE => idempotent on (facility_code, event_time)
+
+            # 1. Insert facility only if it does not already exist.
+            # Do not update facility_dim, because live_observations may reference it by FK.
             con.execute(
                 """
-                INSERT OR REPLACE INTO live_observations VALUES
-                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO facility_dim (
+                    facility_code, facility_name, network_id, network_region,
+                    state, primary_fueltech, fueltech_summary,
+                    capacity_registered_total, unit_count,
+                    latitude, longitude, geom, first_seen, last_seen
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,
+                          CASE WHEN ? IS NOT NULL AND ? IS NOT NULL
+                               THEN ST_Point(?, ?) ELSE NULL END,
+                            ?, ?)
+                ON CONFLICT (facility_code) DO NOTHING
                 """,
-                row,
+                (
+                    *dim_row[:11],
+                    lon, lat,
+                    lon, lat,
+                    dim_row[11],
+                    dim_row[12],
+                ),
             )
+
+            # 2. Insert the actual live observation.
+            # This is the row that makes DB rows increase.
+            con.execute(
+                """
+                INSERT INTO live_observations
+                    (facility_code, event_time, power_mw, emissions_t, ingested_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (facility_code, event_time) DO NOTHING
+                """,
+                fact_row,
+            )
+        
     except Exception as e:  # noqa: BLE001
         print(f"[db] persist failed for {msg.get('facility_code')}: {e}")
 
@@ -281,3 +374,166 @@ def stream_stats() -> dict:
         print(f"[db] stream_stats failed: {e}")
         return {"observations": 0, "facilities": 0,
                 "first_event": None, "last_event": None}
+
+
+# --------------------------------------------------------------------------
+# 3. Facility history (drives the per-facility generation chart)
+# --------------------------------------------------------------------------
+
+def get_facility_history(facility_code: str | None,
+                         limit: int = 120) -> list[tuple]:
+    """Return the most recent observations for one facility, oldest first.
+
+    Used by the popup to render a live-updating generation chart. Up to
+    `limit` rows (default 120 = ~10 hours at 5-min spacing). Returns
+    [(event_time, power_mw, emissions_t), ...]; never raises.
+
+    Extension point: a future market-price/demand layer could be joined
+    in here as additional columns without changing the call site.
+    """
+    if not facility_code:
+        return []
+    try:
+        with _DB_LOCK:
+            con = _connect()
+            rows = con.execute(
+                """
+                SELECT event_time, power_mw, emissions_t
+                FROM (
+                    SELECT event_time, power_mw, emissions_t
+                    FROM live_observations
+                    WHERE facility_code = ?
+                    ORDER BY event_time DESC
+                    LIMIT ?
+                ) t
+                ORDER BY event_time ASC
+                """,
+                [facility_code, limit],
+            ).fetchall()
+            return rows
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] history query failed for {facility_code}: {e}")
+        return []
+
+# --------------------------------------------------------------------------
+# 4. Market data (optional Task 1: price + regional demand)
+# --------------------------------------------------------------------------
+# Schema is per-region, not per-facility, so this lives in its own table
+# (`market_observations`) rather than being squeezed into facility_dim.
+# The table is created on demand by _connect() so build_database.py is
+# unchanged.
+
+def persist_market(msg: dict[str, Any]) -> None:
+    """Persist one per-region market message (price + demand).
+
+    Expected payload fields:
+        network_region    str   e.g. "NSW1"
+        event_time        str   ISO 8601
+        price_aud_mwh     float
+        demand_mw_region  float
+
+    The message is idempotent on (network_region, event_time) so the
+    publisher can replay the same round without creating duplicates.
+    Errors are swallowed so a DB hiccup never kills the MQTT loop.
+    """
+    try:
+        region = msg.get("network_region")
+        event_time = msg.get("event_time")
+        if not region or not event_time:
+            # Defensive: PK columns are NOT NULL.
+            return
+        price = msg.get("price_aud_mwh")
+        demand = msg.get("demand_mw_region")
+        now = datetime.now()
+        with _DB_LOCK:
+            con = _connect()
+            con.execute(
+                """
+                INSERT OR REPLACE INTO market_observations
+                    (network_region, event_time,
+                     price_aud_mwh, demand_mw_region, ingested_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (region, event_time, price, demand, now),
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] persist_market failed for {msg.get('network_region')}: {e}")
+
+
+def get_market_latest_by_region() -> dict[str, dict]:
+    """Return the most recent (price, demand) per region from the DB.
+
+    Used as a warm-up / fall-back source when the dashboard restarts and
+    the in-memory MARKET_STATE is still empty. Returns a dict keyed by
+    network_region. Empty dict on any error or empty table.
+
+        {
+          "NSW1": {"price_aud_mwh": 85.4,
+                   "demand_mw_region": 7234.0,
+                   "event_time": <datetime>},
+          ...
+        }
+    """
+    out: dict[str, dict] = {}
+    try:
+        with _DB_LOCK:
+            con = _connect()
+            rows = con.execute(
+                """
+                SELECT network_region, event_time,
+                       price_aud_mwh, demand_mw_region
+                FROM (
+                    SELECT network_region, event_time,
+                           price_aud_mwh, demand_mw_region,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY network_region
+                               ORDER BY event_time DESC
+                           ) AS rn
+                    FROM market_observations
+                ) t
+                WHERE rn = 1
+                """
+            ).fetchall()
+            for region, et, price, demand in rows:
+                out[region] = {
+                    "price_aud_mwh": price,
+                    "demand_mw_region": demand,
+                    "event_time": et,
+                }
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] get_market_latest_by_region failed: {e}")
+    return out
+
+
+def get_market_for_region(network_region: str | None) -> dict | None:
+    """Most recent market record for one region. None if we have nothing.
+
+    Drives the per-region price/demand line inside the facility popup,
+    so a marker click shows BOTH the facility's live power/emissions
+    AND the market context of the region it sits in.
+    """
+    if not network_region:
+        return None
+    try:
+        with _DB_LOCK:
+            con = _connect()
+            row = con.execute(
+                """
+                SELECT event_time, price_aud_mwh, demand_mw_region
+                FROM market_observations
+                WHERE network_region = ?
+                ORDER BY event_time DESC
+                LIMIT 1
+                """,
+                [network_region],
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "event_time": row[0],
+                "price_aud_mwh": row[1],
+                "demand_mw_region": row[2],
+            }
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] get_market_for_region failed for {network_region}: {e}")
+        return None
