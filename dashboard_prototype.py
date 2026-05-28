@@ -1,9 +1,6 @@
 """
 COMP5339 Assignment 2 — Task 5: Real-time NEM facilities dashboard.
 
-PROTOTYPE. The architecture and extension points are described in
-PROJECT_DOC.md; please skim that first if you are reading this for the
-first time.
 
 Run:
     python dashboard_prototype.py
