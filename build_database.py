@@ -20,7 +20,6 @@ tables and (re)creates live_observations only if it does not exist, so
 your accumulated live data is preserved across rebuilds. Use
 `--reset-live` to also wipe live_observations.
 
-See PROJECT_DOC.md §12 (Task 4) for the design rationale.
 """
 
 from __future__ import annotations
