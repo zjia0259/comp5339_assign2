@@ -48,13 +48,13 @@ if not _DB_ENABLED:
 
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
-MQTT_TOPIC = "comp5339/electricity/facility/#"  # wildcard — see PROJECT_DOC §4
+MQTT_TOPIC = "comp5339/electricity/facility/jza/tky"  # wildcard — see PROJECT_DOC §4
 # Optional Task 1 (price + regional demand). The exact topic the teammate's
 # publisher uses for the market feed is not yet confirmed; we subscribe to
 # this wildcard AND content-route inside _on_message, so the dashboard is
 # robust to either topic choice as long as the payload carries the
 # `price_aud_mwh` / `demand_mw_region` keys.
-MQTT_TOPIC_MARKET = "comp5339/electricity/market/#"
+MQTT_TOPIC_MARKET = "comp5339/electricity/market/jza/tky"
 CLIENT_ID = "comp5339_dashboard_subscriber"
 
 # How often the dashboard polls the shared state and re-renders. The
