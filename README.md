@@ -4,6 +4,8 @@ This project implements a real-time dashboard for displaying continuous power ge
 
 The dashboard receives live MQTT messages, stores and reads data from a local DuckDB database, and visualises the latest facility-level and state-level information using Dash and Plotly.
 
+To avoid inconsistencies in the data catalog, the Jupyter script on the data sending end must run on Colab. And then, to emphasize...
+
 ## 1. Project Structure
 
 The main files used in this project are:
